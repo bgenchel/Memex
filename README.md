@@ -10,15 +10,15 @@ from concurrent.futures import as_completed
 from memex import MemoryExecutor
 
 
-def run_amt(input_path, output_path, *, device):
+def task(*args, **kwargs, device):
     # Load and run the model on device, then write output_path deterministically.
     ...
 
 
-if __name__ == "__main__":  # Required by Python's spawn process start method.
-    tasks = [("one.wav", "one.mid"), ("two.wav", "two.mid")]
+if __name__ == "__main__": 
+    tasks = [(*args1), (*args2)]
     with MemoryExecutor(headroom=2048) as executor:
-        futures = [executor.submit(run_amt, *task) for task in tasks]
+        futures = [executor.submit(task, *task) for task in tasks]
         for future in as_completed(futures):
             future.result()
 ```
