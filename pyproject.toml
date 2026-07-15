@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memex"
+version = "0.1.0"
+description = "A memory-aware process executor for CPU and accelerator workloads"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Memex contributors" }]
+dependencies = ["psutil>=5.9"]
+
+[project.optional-dependencies]
+nvidia = ["nvidia-ml-py>=12"]
+test = ["pytest>=8", "pytest-timeout>=2"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memex"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "cuda: requires an explicitly enabled NVIDIA CUDA machine",
+    "cuda_concurrency: launches several simultaneous CUDA contexts",
+]
