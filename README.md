@@ -10,7 +10,7 @@ from concurrent.futures import as_completed
 from memex import MemoryExecutor
 
 
-def task(*args, **kwargs, device):
+def job(*args, **kwargs, device):
     # Load and run the model on device, then write output_path deterministically.
     ...
 
@@ -18,7 +18,7 @@ def task(*args, **kwargs, device):
 if __name__ == "__main__": 
     tasks = [(*args1), (*args2)]
     with MemoryExecutor(headroom=2048) as executor:
-        futures = [executor.submit(task, *task) for task in tasks]
+        futures = [executor.submit(job, *task) for task in tasks]
         for future in as_completed(futures):
             future.result()
 ```
