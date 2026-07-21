@@ -33,6 +33,8 @@ class _Task:
     oom_retries: int = 0
     started: bool = False
     peak_mib: int = 0
+    attempt_estimate_mib: int = 0
+    retry_estimate_mib: int = 0
 
 
 @dataclass
@@ -42,21 +44,34 @@ class _RunningTask:
     process: BaseProcess
     connection: Connection
     reserved_mib: int
+    current_mib: int = 0
     peak_mib: int = 0
+
+
+def _future_commitment_mib(
+    running_tasks: tuple[_RunningTask, ...], device: str
+) -> int:
+    """Return reserved growth not already reflected in device free memory."""
+
+    return sum(
+        max(0, running.reserved_mib - running.current_mib)
+        for running in running_tasks
+        if running.device == device
+    )
 
 
 class MemoryExecutor(Executor):
     """An Executor whose process concurrency is controlled by available memory.
 
     Every task attempt runs in a fresh process created with the ``spawn`` start
-    method. The first task calibrates the executor; subsequent launches reserve
-    the largest per-task memory peak observed during this executor session.
+    method. Concurrency ramps up exponentially while successful task peaks build
+    an online memory estimate of the mean plus two sample standard deviations.
     """
 
     def __init__(
         self,
         *,
-        headroom: int = 1024,
+        headroom: int = 2048,
         poll_interval: float = 0.25,
         inject_device: bool = True,
         device_parameter: str = "device",
@@ -91,9 +106,12 @@ class MemoryExecutor(Executor):
         self._running: dict[int, _RunningTask] = {}
         self._next_identifier = 0
         self._observed_peak_mib: int | None = None
+        self._memory_sample_count = 0
+        self._memory_mean_mib = 0.0
+        self._memory_m2_mib = 0.0
         self._calibration_task: int | None = None
-        self._oom_draining = False
-        self._growth_pause_at_running: int | None = None
+        self._concurrency_limit = 1
+        self._ramp_successes = 0
         self._shutdown_requested = False
         self._backend_closed = False
 
@@ -281,9 +299,10 @@ class MemoryExecutor(Executor):
                     exc_info=True,
                 )
                 continue
-            if current <= running.peak_mib:
-                continue
             with self._lock:
+                running.current_mib = max(0, current)
+                if current <= running.peak_mib:
+                    continue
                 running.peak_mib = current
                 running.task.peak_mib = max(running.task.peak_mib, current)
                 if current > running.reserved_mib:
@@ -291,17 +310,8 @@ class MemoryExecutor(Executor):
                 if self._observed_peak_mib is None or current > self._observed_peak_mib:
                     previous = self._observed_peak_mib
                     self._observed_peak_mib = max(1, current)
-                    # Every active attempt is now conservatively assumed capable
-                    # of reaching the new session maximum. Also require at least
-                    # one completion before adding more work after live growth.
-                    for active in self._running.values():
-                        active.reserved_mib = max(
-                            active.reserved_mib, self._observed_peak_mib
-                        )
-                    if self._calibration_task is None:
-                        self._growth_pause_at_running = len(self._running)
                     _LOG.info(
-                        "memory estimate increased from %s to %d MiB",
+                        "observed memory peak increased from %s to %d MiB",
                         previous,
                         self._observed_peak_mib,
                     )
@@ -362,6 +372,9 @@ class MemoryExecutor(Executor):
             likely_oom = running.process.exitcode in {-9, 9}
             self._handle_failure(task, exception, likely_oom)
         elif payload[0] == "result":
+            with self._lock:
+                self._record_successful_peak(task.peak_mib)
+                self._record_ramp_success()
             task.future.set_result(payload[1])
             with self._lock:
                 self._completed += 1
@@ -388,11 +401,16 @@ class MemoryExecutor(Executor):
         if likely_oom and task.oom_retries < self._max_oom_retries:
             task.oom_retries += 1
             with self._lock:
-                baseline = max(self._observed_peak_mib or 1, task.peak_mib, 1)
-                increased = max(baseline + 1, math.ceil(baseline * 1.25))
-                self._observed_peak_mib = increased
+                baseline = max(
+                    task.retry_estimate_mib,
+                    task.attempt_estimate_mib,
+                    task.peak_mib,
+                    self._estimated_task_mib() or 1,
+                )
+                increased = baseline + 1024
+                task.retry_estimate_mib = increased
                 self._pending.appendleft(task)
-                self._oom_draining = True
+                self._ramp_successes = 0
             _LOG.warning(
                 "task %d likely ran out of memory; retry %d/%d with %d MiB estimate",
                 task.identifier,
@@ -425,38 +443,37 @@ class MemoryExecutor(Executor):
                 return
             if self._calibration_task is not None:
                 return
-            if self._oom_draining:
-                if self._running:
-                    return
-                self._oom_draining = False
-            if self._growth_pause_at_running is not None:
-                if len(self._running) >= self._growth_pause_at_running:
-                    return
-                self._growth_pause_at_running = None
+            if len(self._running) >= self._concurrency_limit:
+                return
 
         devices = self._safe_devices()
+        effective_by_device: dict[str, int] = {}
+        with self._lock:
+            running_tasks = tuple(self._running.values())
+        for device in devices:
+            future_commitment = _future_commitment_mib(
+                running_tasks, device.name
+            )
+            effective_by_device[device.name] = (
+                device.available_mib - self._headroom - future_commitment
+            )
+
         while True:
             with self._lock:
                 if not self._pending:
                     return
+                if len(self._running) >= self._concurrency_limit:
+                    return
                 task = self._pending[0]
-                reservations: dict[str, int] = {}
-                for running in self._running.values():
-                    reservations[running.device] = (
-                        reservations.get(running.device, 0) + running.reserved_mib
-                    )
-                estimate = self._observed_peak_mib
-                unknown = estimate is None
+                learned_estimate = self._estimated_task_mib()
+                estimate = max(task.retry_estimate_mib, learned_estimate or 0)
+                unknown = estimate <= 0
                 if unknown and self._running:
                     return
 
             choices: list[tuple[int, MemoryDevice]] = []
             for device in devices:
-                effective = (
-                    device.available_mib
-                    - reservations.get(device.name, 0)
-                    - self._headroom
-                )
+                effective = effective_by_device[device.name]
                 if unknown:
                     if effective > 0:
                         choices.append((effective, device))
@@ -481,7 +498,9 @@ class MemoryExecutor(Executor):
                     task.started = True
                 if unknown:
                     self._calibration_task = task.identifier
+                task.attempt_estimate_mib = 0 if unknown else reservation
             self._start_attempt(task, selected.name, reservation)
+            effective_by_device[selected.name] -= reservation
             if unknown:
                 return
             # The device snapshot stays valid for this pass because every launch
@@ -530,6 +549,7 @@ class MemoryExecutor(Executor):
             if initial > 0:
                 with self._lock:
                     running.peak_mib = initial
+                    running.current_mib = initial
                     task.peak_mib = max(task.peak_mib, initial)
                     running.reserved_mib = max(running.reserved_mib, initial)
                     if (
@@ -542,6 +562,39 @@ class MemoryExecutor(Executor):
             task.identifier,
             device,
             reservation,
+        )
+
+    def _memory_stddev_mib(self) -> float | None:
+        if self._memory_sample_count < 2:
+            return None
+        return math.sqrt(self._memory_m2_mib / (self._memory_sample_count - 1))
+
+    def _estimated_task_mib(self) -> int | None:
+        if self._memory_sample_count == 0:
+            return None
+        stddev = self._memory_stddev_mib() or 0.0
+        return max(1, math.ceil(self._memory_mean_mib + 2.0 * stddev))
+
+    def _record_successful_peak(self, peak_mib: int) -> None:
+        if peak_mib <= 0:
+            return
+        self._memory_sample_count += 1
+        delta = peak_mib - self._memory_mean_mib
+        self._memory_mean_mib += delta / self._memory_sample_count
+        delta_after_mean = peak_mib - self._memory_mean_mib
+        self._memory_m2_mib += delta * delta_after_mean
+
+    def _record_ramp_success(self) -> None:
+        self._ramp_successes += 1
+        if self._ramp_successes < self._concurrency_limit:
+            return
+        previous = self._concurrency_limit
+        self._concurrency_limit *= 2
+        self._ramp_successes = 0
+        _LOG.info(
+            "successful warm-up increased concurrency limit from %d to %d",
+            previous,
+            self._concurrency_limit,
         )
 
     def _fail_all_tasks(self, exception: BaseException) -> None:

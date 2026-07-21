@@ -23,7 +23,15 @@ if __name__ == "__main__":
             future.result()
 ```
 
-`headroom` and all reported memory values are in MiB. Explicit backends are
+`headroom` and all reported memory values are in MiB. Its default is 2048 MiB,
+and that amount is always excluded from schedulable memory on every device.
+Memex starts one task, doubles its concurrency limit after each successful
+warm-up stage, and learns task memory from all successfully completed peaks
+using the mean plus two sample standard deviations. Likely out-of-memory tasks
+are retried with a task-local estimate increased by 1024 MiB; a retry does not
+inflate the estimate used for unrelated work.
+
+Explicit backends are
 selected with `backend="cpu"`, `"cuda"`, `"amd"`, or `"apple"`; `"auto"`
 prefers an available accelerator. NVIDIA support requires the optional
 `nvidia-ml-py` dependency.

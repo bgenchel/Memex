@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 from concurrent.futures import CancelledError, Future
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from memex import MemoryExecutor, ProcessExitedError
+from memex._executor import _RunningTask, _Task, _future_commitment_mib
 
 
 def return_call_details(value: int, *, device: str) -> tuple[int, str, int]:
@@ -192,6 +194,54 @@ def test_stats_are_structured_and_stringifiable() -> None:
     assert stats.devices[0].device == "cpu"
     assert "MemoryExecutor" in str(stats)
     assert "Completed: 1" in str(stats)
+
+
+def test_default_headroom_is_2048_mib() -> None:
+    with MemoryExecutor(backend="cpu") as executor:
+        assert executor.stats().headroom_mib == 2048
+
+
+def test_estimate_is_online_mean_plus_two_sample_stddevs() -> None:
+    with MemoryExecutor(backend="cpu", headroom=0) as executor:
+        with executor._lock:
+            executor._record_successful_peak(100)
+            executor._record_successful_peak(200)
+            assert executor._memory_sample_count == 2
+            assert executor._memory_mean_mib == 150
+            assert executor._memory_stddev_mib() == pytest.approx(math.sqrt(5000))
+            assert executor._estimated_task_mib() == math.ceil(
+                150 + 2 * math.sqrt(5000)
+            )
+
+
+def test_available_memory_only_charges_unconsumed_reservations() -> None:
+    future: Future[object] = Future()
+    task = _Task(0, future, sleep_then_return, (0.01,), {})
+    running = _RunningTask(
+        task=task,
+        device="cuda:0",
+        process=None,  # type: ignore[arg-type]
+        connection=None,  # type: ignore[arg-type]
+        reserved_mib=4592,
+        current_mib=4000,
+    )
+
+    assert _future_commitment_mib((running,), "cuda:0") == 592
+    assert _future_commitment_mib((running,), "cuda:1") == 0
+
+
+def test_successful_warmup_doubles_concurrency_limit() -> None:
+    with MemoryExecutor(backend="cpu", headroom=0, poll_interval=0.01) as executor:
+        assert executor.submit(sleep_then_return, 0.02).result(timeout=10) == "cpu"
+        assert executor._concurrency_limit == 2
+
+        pair = [executor.submit(sleep_then_return, 0.02) for _ in range(2)]
+        assert [future.result(timeout=10) for future in pair] == ["cpu", "cpu"]
+        assert executor._concurrency_limit == 4
+
+        quartet = [executor.submit(sleep_then_return, 0.02) for _ in range(4)]
+        assert [future.result(timeout=10) for future in quartet] == ["cpu"] * 4
+        assert executor._concurrency_limit == 8
 
 
 def test_shutdown_cancel_futures_cancels_queued_work() -> None:
