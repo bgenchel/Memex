@@ -110,8 +110,6 @@ class MemoryExecutor(Executor):
         self._memory_mean_mib = 0.0
         self._memory_m2_mib = 0.0
         self._calibration_task: int | None = None
-        self._concurrency_limit = 1
-        self._ramp_successes = 0
         self._shutdown_requested = False
         self._backend_closed = False
 
@@ -374,7 +372,6 @@ class MemoryExecutor(Executor):
         elif payload[0] == "result":
             with self._lock:
                 self._record_successful_peak(task.peak_mib)
-                self._record_ramp_success()
             task.future.set_result(payload[1])
             with self._lock:
                 self._completed += 1
@@ -410,7 +407,6 @@ class MemoryExecutor(Executor):
                 increased = baseline + 1024
                 task.retry_estimate_mib = increased
                 self._pending.appendleft(task)
-                self._ramp_successes = 0
             _LOG.warning(
                 "task %d likely ran out of memory; retry %d/%d with %d MiB estimate",
                 task.identifier,
@@ -443,8 +439,6 @@ class MemoryExecutor(Executor):
                 return
             if self._calibration_task is not None:
                 return
-            if len(self._running) >= self._concurrency_limit:
-                return
 
         devices = self._safe_devices()
         effective_by_device: dict[str, int] = {}
@@ -461,8 +455,6 @@ class MemoryExecutor(Executor):
         while True:
             with self._lock:
                 if not self._pending:
-                    return
-                if len(self._running) >= self._concurrency_limit:
                     return
                 task = self._pending[0]
                 learned_estimate = self._estimated_task_mib()
@@ -583,19 +575,6 @@ class MemoryExecutor(Executor):
         self._memory_mean_mib += delta / self._memory_sample_count
         delta_after_mean = peak_mib - self._memory_mean_mib
         self._memory_m2_mib += delta * delta_after_mean
-
-    def _record_ramp_success(self) -> None:
-        self._ramp_successes += 1
-        if self._ramp_successes < self._concurrency_limit:
-            return
-        previous = self._concurrency_limit
-        self._concurrency_limit *= 2
-        self._ramp_successes = 0
-        _LOG.info(
-            "successful warm-up increased concurrency limit from %d to %d",
-            previous,
-            self._concurrency_limit,
-        )
 
     def _fail_all_tasks(self, exception: BaseException) -> None:
         with self._lock:

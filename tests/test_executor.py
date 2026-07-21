@@ -35,6 +35,20 @@ def timed_task(delay: float, *, device: str) -> tuple[float, float]:
     return started, time.monotonic()
 
 
+def wait_for_peer_tasks(
+    marker_dir: str, participants: int, *, device: str
+) -> int:
+    directory = Path(marker_dir)
+    (directory / str(os.getpid())).touch()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        count = len(tuple(directory.iterdir()))
+        if count >= participants:
+            return count
+        time.sleep(0.01)
+    return len(tuple(directory.iterdir()))
+
+
 def fail_once_with_oom(marker: str, *, device: str) -> str:
     path = Path(marker)
     try:
@@ -230,20 +244,6 @@ def test_available_memory_only_charges_unconsumed_reservations() -> None:
     assert _future_commitment_mib((running,), "cuda:1") == 0
 
 
-def test_successful_warmup_doubles_concurrency_limit() -> None:
-    with MemoryExecutor(backend="cpu", headroom=0, poll_interval=0.01) as executor:
-        assert executor.submit(sleep_then_return, 0.02).result(timeout=10) == "cpu"
-        assert executor._concurrency_limit == 2
-
-        pair = [executor.submit(sleep_then_return, 0.02) for _ in range(2)]
-        assert [future.result(timeout=10) for future in pair] == ["cpu", "cpu"]
-        assert executor._concurrency_limit == 4
-
-        quartet = [executor.submit(sleep_then_return, 0.02) for _ in range(4)]
-        assert [future.result(timeout=10) for future in quartet] == ["cpu"] * 4
-        assert executor._concurrency_limit == 8
-
-
 def test_shutdown_cancel_futures_cancels_queued_work() -> None:
     executor = MemoryExecutor(backend="cpu", headroom=0, poll_interval=0.02)
     first = executor.submit(sleep_then_return, 0.25)
@@ -269,6 +269,23 @@ def test_calibration_runs_alone_then_scheduler_allows_concurrency() -> None:
 
     assert second_interval[0] >= first_interval[1] - 0.02
     assert third_interval[0] < second_interval[1]
+
+
+def test_scheduler_has_no_job_count_ceiling_after_calibration(
+    tmp_path: Path,
+) -> None:
+    marker_dir = tmp_path / "peers"
+    marker_dir.mkdir()
+    participants = 4
+    with MemoryExecutor(backend="cpu", headroom=0, poll_interval=0.01) as executor:
+        executor.submit(sleep_then_return, 0.02).result(timeout=10)
+        futures = [
+            executor.submit(wait_for_peer_tasks, str(marker_dir), participants)
+            for _ in range(participants)
+        ]
+        counts = [future.result(timeout=10) for future in futures]
+
+    assert counts == [participants] * participants
 
 
 @pytest.mark.parametrize(
