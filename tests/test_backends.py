@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from types import SimpleNamespace
 
@@ -52,6 +53,41 @@ class FakeNVML:
         )
 
 
+class DuplicateProcessNVML(FakeNVML):
+    def nvmlDeviceGetMemoryInfo(self, handle: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            total=24 * 1024 * 1024 * 1024,
+            free=12 * 1024 * 1024 * 1024,
+        )
+
+    def nvmlDeviceGetComputeRunningProcesses_v3(
+        self, handle: int
+    ) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                pid=os.getpid(), usedGpuMemory=4592 * 1024 * 1024
+            )
+        ]
+
+    def nvmlDeviceGetComputeRunningProcesses(
+        self, handle: int
+    ) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                pid=os.getpid(), usedGpuMemory=4590 * 1024 * 1024
+            )
+        ]
+
+    def nvmlDeviceGetGraphicsRunningProcesses(
+        self, handle: int
+    ) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                pid=os.getpid(), usedGpuMemory=4591 * 1024 * 1024
+            )
+        ]
+
+
 def test_cpu_backend_reports_positive_memory() -> None:
     backend = CPUBackend()
     (device,) = backend.devices()
@@ -97,3 +133,20 @@ def test_cuda_backend_rejects_empty_visible_device_set(monkeypatch) -> None:
     with pytest.raises(BackendUnavailableError, match="exposes no"):
         CUDABackend()
     assert nvml.shutdown_called
+
+
+def test_cuda_process_memory_counts_each_pid_once_across_nvml_apis(
+    monkeypatch,
+) -> None:
+    nvml = DuplicateProcessNVML()
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(
+        "memex._backends._process_tree_pids", lambda pid: {pid}
+    )
+
+    backend = CUDABackend()
+    try:
+        assert backend.process_memory_mib(os.getpid(), "cuda:0") == 4592
+    finally:
+        backend.close()

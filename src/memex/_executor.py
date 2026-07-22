@@ -21,6 +21,7 @@ from ._worker import run_task
 
 _LOG = logging.getLogger("memex")
 _T = TypeVar("_T")
+_MEMORY_SAMPLE_WINDOW = 64
 
 
 @dataclass
@@ -106,6 +107,9 @@ class MemoryExecutor(Executor):
         self._running: dict[int, _RunningTask] = {}
         self._next_identifier = 0
         self._observed_peak_mib: int | None = None
+        self._memory_peaks_mib: deque[int] = deque(
+            maxlen=_MEMORY_SAMPLE_WINDOW
+        )
         self._memory_sample_count = 0
         self._memory_mean_mib = 0.0
         self._memory_m2_mib = 0.0
@@ -210,6 +214,10 @@ class MemoryExecutor(Executor):
                 failed=self._failed,
                 cancelled=self._cancelled,
                 observed_peak_mib=self._observed_peak_mib,
+                mean_task_mib=(
+                    self._memory_mean_mib if self._memory_sample_count else None
+                ),
+                stddev_task_mib=self._memory_stddev_mib(),
                 headroom_mib=self._headroom,
                 devices=device_stats,
             )
@@ -570,11 +578,15 @@ class MemoryExecutor(Executor):
     def _record_successful_peak(self, peak_mib: int) -> None:
         if peak_mib <= 0:
             return
-        self._memory_sample_count += 1
-        delta = peak_mib - self._memory_mean_mib
-        self._memory_mean_mib += delta / self._memory_sample_count
-        delta_after_mean = peak_mib - self._memory_mean_mib
-        self._memory_m2_mib += delta * delta_after_mean
+        self._memory_peaks_mib.append(peak_mib)
+        self._memory_sample_count = len(self._memory_peaks_mib)
+        self._memory_mean_mib = (
+            math.fsum(self._memory_peaks_mib) / self._memory_sample_count
+        )
+        self._memory_m2_mib = math.fsum(
+            (sample - self._memory_mean_mib) ** 2
+            for sample in self._memory_peaks_mib
+        )
 
     def _fail_all_tasks(self, exception: BaseException) -> None:
         with self._lock:

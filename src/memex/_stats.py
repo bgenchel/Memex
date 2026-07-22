@@ -24,11 +24,23 @@ class ExecutorStats:
     failed: int
     cancelled: int
     observed_peak_mib: int | None
+    mean_task_mib: float | None
+    stddev_task_mib: float | None
     headroom_mib: int
     devices: tuple[DeviceStats, ...]
 
     def __str__(self) -> str:
         peak = "unknown" if self.observed_peak_mib is None else f"{self.observed_peak_mib} MiB"
+        mean = (
+            "unknown"
+            if self.mean_task_mib is None
+            else f"{self.mean_task_mib:.1f} MiB"
+        )
+        stddev = (
+            "unknown"
+            if self.stddev_task_mib is None
+            else f"{self.stddev_task_mib:.1f} MiB"
+        )
         lines = [
             "MemoryExecutor",
             f"Backend: {self.backend.upper()}",
@@ -41,6 +53,8 @@ class ExecutorStats:
             f"  Cancelled: {self.cancelled}",
             "Learned memory",
             f"  Peak observed: {peak}",
+            f"  Window mean:   {mean}",
+            f"  Window stddev: {stddev}",
             f"  Headroom:      {self.headroom_mib} MiB",
             "Devices",
         ]
@@ -55,4 +69,3 @@ class ExecutorStats:
                 ]
             )
         return "\n".join(lines)
-

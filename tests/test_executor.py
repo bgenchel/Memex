@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections import deque
 from concurrent.futures import CancelledError, Future
 from pathlib import Path
 
@@ -205,9 +206,13 @@ def test_stats_are_structured_and_stringifiable() -> None:
     assert stats.backend == "cpu"
     assert stats.completed == 1
     assert stats.headroom_mib == 12
+    assert stats.mean_task_mib is not None
+    assert stats.stddev_task_mib is None
     assert stats.devices[0].device == "cpu"
     assert "MemoryExecutor" in str(stats)
     assert "Completed: 1" in str(stats)
+    assert "Window mean:" in str(stats)
+    assert "Window stddev:" in str(stats)
 
 
 def test_default_headroom_is_2048_mib() -> None:
@@ -226,6 +231,21 @@ def test_estimate_is_online_mean_plus_two_sample_stddevs() -> None:
             assert executor._estimated_task_mib() == math.ceil(
                 150 + 2 * math.sqrt(5000)
             )
+
+
+def test_memory_estimate_forgets_samples_outside_rolling_window() -> None:
+    with MemoryExecutor(backend="cpu", headroom=0) as executor:
+        with executor._lock:
+            executor._memory_peaks_mib = deque(maxlen=3)
+            executor._record_successful_peak(1000)
+            executor._record_successful_peak(100)
+            executor._record_successful_peak(100)
+            assert executor._estimated_task_mib() > 100
+
+            executor._record_successful_peak(100)
+            assert tuple(executor._memory_peaks_mib) == (100, 100, 100)
+            assert executor._memory_sample_count == 3
+            assert executor._estimated_task_mib() == 100
 
 
 def test_available_memory_only_charges_unconsumed_reservations() -> None:

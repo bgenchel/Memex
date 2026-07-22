@@ -197,14 +197,13 @@ class CUDABackend(MemoryBackend):
         handle = self._handles[index]
         total_bytes = int(self._nvml.nvmlDeviceGetMemoryInfo(handle).total)
         pids = _process_tree_pids(pid)
-        used = 0
         functions = (
             "nvmlDeviceGetComputeRunningProcesses_v3",
             "nvmlDeviceGetComputeRunningProcesses",
             "nvmlDeviceGetGraphicsRunningProcesses_v3",
             "nvmlDeviceGetGraphicsRunningProcesses",
         )
-        seen: set[tuple[int, int]] = set()
+        memory_by_pid: dict[int, int] = {}
         for function_name in functions:
             function = getattr(self._nvml, function_name, None)
             if function is None:
@@ -216,15 +215,19 @@ class CUDABackend(MemoryBackend):
             for record in records:
                 record_pid = int(record.pid)
                 memory = int(getattr(record, "usedGpuMemory", 0))
-                key = (record_pid, memory)
                 if (
                     record_pid in pids
-                    and key not in seen
                     and 0 < memory <= total_bytes
                 ):
-                    used += memory
-                    seen.add(key)
-        return math.ceil(used / _MIB)
+                    # NVML exposes versioned compute and graphics queries as
+                    # alternatives. The same PID may appear in several of them
+                    # with slightly different readings because the calls are not
+                    # atomic. Count the process once, retaining its largest
+                    # reading, while still summing distinct descendant PIDs.
+                    memory_by_pid[record_pid] = max(
+                        memory_by_pid.get(record_pid, 0), memory
+                    )
+        return math.ceil(sum(memory_by_pid.values()) / _MIB)
 
     def close(self) -> None:
         try:

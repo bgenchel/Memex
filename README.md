@@ -26,8 +26,8 @@ if __name__ == "__main__":
 `headroom` and all reported memory values are in MiB. Its default is 2048 MiB,
 and that amount is always excluded from schedulable memory on every device.
 Memex calibrates one task when memory requirements are unknown, then fills
-available device memory using an estimate learned from all successfully
-completed peaks: the mean plus two sample standard deviations. Likely
+available device memory using an estimate learned from the most recent 64
+successfully completed peaks: the mean plus two sample standard deviations. Likely
 out-of-memory tasks are retried with a task-local estimate increased by 1024
 MiB; a retry does not inflate the estimate used for unrelated work.
 
